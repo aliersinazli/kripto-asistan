@@ -68,7 +68,14 @@ app.post('/account', async (req, res) => {
   if (!apiKey || !apiSecret) return res.status(400).json({ error: 'API bilgileri eksik' });
   try {
     const data = await binanceRequest('account', {}, apiKey, apiSecret);
-    if (data.code) return res.status(400).json({ error: data.msg });
+
+    // Binance hata kodu döndürdüyse
+    if (data.code) return res.status(400).json({ error: `Binance hatası: ${data.msg} (kod: ${data.code})` });
+
+    // balances alanı yoksa veya dizi değilse
+    if (!data.balances || !Array.isArray(data.balances)) {
+      return res.status(400).json({ error: 'Binance beklenmedik yanıt döndürdü. API izinlerini kontrol et (sadece Okuma izni olmalı).', raw: JSON.stringify(data).slice(0, 200) });
+    }
 
     // Sıfırdan büyük bakiyeleri filtrele
     const balances = data.balances.filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0);
