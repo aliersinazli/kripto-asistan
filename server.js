@@ -7,32 +7,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Binance imza oluşturucu
 function sign(queryString, secret) {
   return crypto.createHmac('sha256', secret).update(queryString).digest('hex');
 }
 
-// Binance'e istek atan yardımcı fonksiyon
 function binanceRequest(path, params, apiKey, apiSecret) {
   return new Promise((resolve, reject) => {
     const timestamp = Date.now();
     const queryString = new URLSearchParams({ ...params, timestamp }).toString();
     const signature = sign(queryString, apiSecret);
     const fullPath = `/api/v3/${path}?${queryString}&signature=${signature}`;
-
     const options = {
       hostname: 'api.binance.com',
       path: fullPath,
       method: 'GET',
       headers: { 'X-MBX-APIKEY': apiKey }
     };
-
     const req = https.request(options, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         try { resolve(JSON.parse(data)); }
-        catch (e) { reject(e); }
+        catch (e) { reject(new Error('JSON parse hatası: ' + data.slice(0, 100))); }
       });
     });
     req.on('error', reject);
@@ -40,11 +36,9 @@ function binanceRequest(path, params, apiKey, apiSecret) {
   });
 }
 
-// Fiyat çek (public, auth gerekmez)
 function getPrice(symbol) {
   return new Promise((resolve, reject) => {
-    const path = `/api/v3/ticker/24hr?symbol=${symbol}`;
-    https.get(`https://api.binance.com${path}`, res => {
+    https.get(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -55,29 +49,48 @@ function getPrice(symbol) {
   });
 }
 
-// ── ROUTES ──────────────────────────────────────────
-
-// Sunucu sağlık kontrolü
 app.get('/ping', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
-// Hesap bilgisi + bakiye
+// DEBUG endpoint — Binance'den ham veriyi göster
+app.post('/debug', async (req, res) => {
+  const { apiKey, apiSecret } = req.body;
+  if (!apiKey || !apiSecret) return res.status(400).json({ error: 'Eksik' });
+  try {
+    const data = await binanceRequest('account', { omitZeroBalances: true }, apiKey, apiSecret);
+    res.json({
+      type: typeof data,
+      isArray: Array.isArray(data),
+      keys: typeof data === 'object' ? Object.keys(data) : [],
+      hasBalances: data && data.balances ? true : false,
+      balancesType: data && data.balances ? typeof data.balances : 'yok',
+      isBalancesArray: data && data.balances ? Array.isArray(data.balances) : false,
+      code: data ? data.code : null,
+      msg: data ? data.msg : null,
+      sample: JSON.stringify(data).slice(0, 400)
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/account', async (req, res) => {
   const { apiKey, apiSecret } = req.body;
   if (!apiKey || !apiSecret) return res.status(400).json({ error: 'API bilgileri eksik' });
   try {
-    const data = await binanceRequest('account', {}, apiKey, apiSecret);
+    const data = await binanceRequest('account', { omitZeroBalances: true }, apiKey, apiSecret);
 
-    // Binance hata kodu döndürdüyse
-    if (data.code) return res.status(400).json({ error: `Binance hatası: ${data.msg} (kod: ${data.code})` });
-
-    // balances alanı yoksa veya dizi değilse
-    if (!data.balances || !Array.isArray(data.balances)) {
-      return res.status(400).json({ error: 'Binance beklenmedik yanıt döndürdü. API izinlerini kontrol et (sadece Okuma izni olmalı).', raw: JSON.stringify(data).slice(0, 200) });
+    if (!data) return res.status(400).json({ error: 'Binance boş yanıt döndürdü' });
+    if (data.code) return res.status(400).json({ error: `Binance: ${data.msg} (${data.code})` });
+    if (!Array.isArray(data.balances)) {
+      return res.status(400).json({
+        error: 'Beklenmedik format',
+        keys: Object.keys(data),
+        raw: JSON.stringify(data).slice(0, 300)
+      });
     }
 
-    // Sıfırdan büyük bakiyeleri filtrele
     const balances = data.balances.filter(b => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0);
     res.json({ balances, makerCommission: data.makerCommission });
   } catch (e) {
@@ -85,33 +98,18 @@ app.post('/account', async (req, res) => {
   }
 });
 
-// Açık emirler
 app.post('/open-orders', async (req, res) => {
   const { apiKey, apiSecret } = req.body;
   if (!apiKey || !apiSecret) return res.status(400).json({ error: 'API bilgileri eksik' });
   try {
     const data = await binanceRequest('openOrders', {}, apiKey, apiSecret);
     if (data.code) return res.status(400).json({ error: data.msg });
-    res.json(data);
+    res.json(Array.isArray(data) ? data : []);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// İşlem geçmişi
-app.post('/my-trades', async (req, res) => {
-  const { apiKey, apiSecret, symbol } = req.body;
-  if (!apiKey || !apiSecret || !symbol) return res.status(400).json({ error: 'Eksik parametre' });
-  try {
-    const data = await binanceRequest('myTrades', { symbol, limit: 20 }, apiKey, apiSecret);
-    if (data.code) return res.status(400).json({ error: data.msg });
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// 24 saatlik fiyat verisi (public)
 app.get('/prices', async (req, res) => {
   const symbols = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','AVAXUSDT','LINKUSDT','ADAUSDT','DOTUSDT','MATICUSDT','ATOMUSDT'];
   try {
@@ -130,4 +128,4 @@ app.get('/prices', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Kripto Asistan sunucu çalışıyor: port ${PORT}`));
+app.listen(PORT, () => console.log(`Kripto Asistan sunucu: port ${PORT}`));
